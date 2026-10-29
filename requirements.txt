@@ -1,0 +1,6 @@
+---
+
+### 2. `requirements.txt`
+
+```text
+rich>=13.0.0
