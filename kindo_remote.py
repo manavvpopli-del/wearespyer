@@ -41,7 +41,7 @@ def get_local_ip() -> str:
 
 def generate_qr_terminal(url: str):
     """Terminalda ASCII QR kod yaradır."""
-    console = rich.get_console()
+    console = Console()
     console.print("\n[bold cyan]Kindo Phone Remote - Reverse Mirroring[/bold cyan]")
     console.print(f"URL: [link]{url}[/link]")
     console.print("Telefonunla skanla və 'Start Mirroring'ə bas:\n")
@@ -74,7 +74,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h1>Kindo Phone Client</h1>
-    <p>Bu səhifə telefonun ekranını PC-yə stream edəcək və PC-dən gələn inputları qəbul edəcək.</p>
+    <p>Bu səhifə telefon ekranını PC-yə ötürür və brauzer daxilində sintez edilmiş input hadisələrini qəbul edir. Təhlükəsizlik məhdudiyyətlərinə görə başqa tətbiqləri və əməliyyat sistemini idarə edə bilməz.</p>
     <button id="startBtn">Start Mirroring & Input Bridge</button>
     <button id="fsBtn">Toggle Fullscreen</button>
     <div id="status">Hazırdır. Dəyərləndirmə üçün 'Start'ə bas.</div>
@@ -83,6 +83,8 @@ HTML_TEMPLATE = """
     <script>
         let ws;
         let streamActive = false;
+        let streamInterval = null;
+        let activeStream = null;
         let logDiv = document.getElementById('log');
         const statusDiv = document.getElementById('status');
 
@@ -109,9 +111,10 @@ HTML_TEMPLATE = """
                     video: { frameRate: 15 },
                     audio: false
                 });
+                stream.getVideoTracks()[0].addEventListener('ended', stopStreaming);
 
                 // WebSocket bağlantısı
-                ws = new WebSocket(`ws://${location.host}/ws`);
+                ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
                 
                 ws.onopen = () => {
                     log("WebSocket bağlandı.");
@@ -138,6 +141,7 @@ HTML_TEMPLATE = """
 
         function startStreaming(stream) {
             streamActive = true;
+            activeStream = stream;
             const canvas = document.createElement('canvas');
             const ctx = canvas.getContext('2d');
             const video = document.createElement('video');
@@ -149,7 +153,7 @@ HTML_TEMPLATE = """
             canvas.height = window.screen.height;
 
             // Hər 100ms-də bir frame çək və göndər
-            const interval = setInterval(() => {
+            streamInterval = setInterval(() => {
                 if (!streamActive) return;
                 try {
                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -171,13 +175,24 @@ HTML_TEMPLATE = """
 
         function stopStreaming() {
             streamActive = false;
-            if (ws) ws.close();
+            if (streamInterval !== null) {
+                clearInterval(streamInterval);
+                streamInterval = null;
+            }
+            if (activeStream) {
+                activeStream.getTracks().forEach(track => track.stop());
+                activeStream = null;
+            }
+            if (ws && ws.readyState !== WebSocket.CLOSED) {
+                ws.close();
+            }
         }
 
         // PC-dən gələn inputları işlə
         function handleInput(input) {
             if (input.type === 'key') {
-                const event = new KeyboardEvent(input.action, {
+                const eventType = input.action === 'down' ? 'keydown' : 'keyup';
+                const event = new KeyboardEvent(eventType, {
                     key: input.key,
                     code: input.code,
                     bubbles: true,
@@ -186,9 +201,10 @@ HTML_TEMPLATE = """
                 document.dispatchEvent(event);
                 log(`Key: ${input.key} (${input.action})`);
             } else if (input.type === 'mouse') {
-                const x = input.x * window.screen.width;
-                const y = input.y * window.screen.height;
-                const event = new MouseEvent(input.action, {
+                const x = input.x * window.innerWidth;
+                const y = input.y * window.innerHeight;
+                const eventType = input.action === 'move' ? 'mousemove' : input.action;
+                const event = new MouseEvent(eventType, {
                     view: window,
                     bubbles: true,
                     cancelable: true,
@@ -213,6 +229,8 @@ class State:
         self.current_frame = None
         self.is_active = False
         self.ws_connection = None
+        self.loop = None
+        self.send_lock = None
 
 state = State()
 
@@ -222,39 +240,66 @@ async def index():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Telefonun brauzerindən gələn frame-ları qəbul edir.
-    """
+    """Telefon brauzerindən gələn frame-ları qəbul edir."""
     await websocket.accept()
     state.ws_connection = websocket
+    state.loop = asyncio.get_running_loop()
+    state.send_lock = asyncio.Lock()
     print("[WS] Telefon bağlandı.")
 
     try:
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
-            
-            if msg["type"] == "frame":
-                # Base64 JPEG decode et
-                jpeg_bytes = base64.b64decode(msg["data"])
+
+            if msg.get("type") == "frame" and isinstance(msg.get("data"), str):
+                jpeg_bytes = base64.b64decode(msg["data"], validate=True)
                 state.current_frame = jpeg_bytes
                 state.is_active = True
-                
     except WebSocketDisconnect:
-        state.is_active = False
-        state.ws_connection = None
         print("[WS] Telefon ayrıldı.")
+    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+        print(f"[WS] Yanlış mesaj qəbul edildi: {exc}")
+    finally:
+        if state.ws_connection is websocket:
+            state.is_active = False
+            state.ws_connection = None
+            state.loop = None
+            state.send_lock = None
+async def _send_to_phone_async(websocket: WebSocket, lock: asyncio.Lock, payload: str):
+    """WebSocket-ə yalnız onun event loop-u daxilində təhlükəsiz yazır."""
+    async with lock:
+        if state.ws_connection is websocket:
+            await websocket.send_text(payload)
+
 
 def send_to_phone(data: dict):
-    """PC-dən telefona input göndərir."""
-    if state.ws_connection:
-        try:
-            # WebSocket sendi async olduğu üçün, sync kontekstdən async-a köçürmək lazımdır
-            loop = asyncio.get_event_loop()
-            loop.create_task(state.ws_connection.send_text(json.dumps(data)))
-        except Exception as e:
-            print(f"Send to phone error: {e}")
+    """PC-dən telefona input göndərir; aktiv paylaşım olmayanda heç nə ötürmür."""
+    loop = state.loop
+    websocket = state.ws_connection
+    lock = state.send_lock
 
+    if not state.is_active or loop is None or websocket is None or lock is None:
+        return
+    if not loop.is_running():
+        return
+
+    try:
+        payload = json.dumps(data)
+        future = asyncio.run_coroutine_threadsafe(
+            _send_to_phone_async(websocket, lock, payload),
+            loop,
+        )
+
+        def report_send_error(result):
+            try:
+                result.result()
+            except Exception as exc:
+                print(f"Send to phone error: {exc}")
+
+        future.add_done_callback(report_send_error)
+    except Exception as exc:
+        print(f"Send to phone error: {exc}")
 # --- Input Hook Listener (PC Input -> Phone) ---
 import keyboard
 import pyautogui
@@ -294,40 +339,124 @@ def input_hook_listener():
         time.sleep(0.01) # 100ms poll
 
 # --- TUI Renderer (Terminalda Ekran Görüntüsü) ---
+def render_frame(frame_bytes: bytes | None) -> Text:
+    """JPEG frame-i terminal ölçüsünə uyğun rəngli simvollara çevirir."""
+    if not frame_bytes:
+        return Text("Telefon gözlənilir. QR kodu skan edib paylaşımı başladın.", style="dim")
+
+    width = max(20, min(TERMINAL_WIDTH - 4, 120))
+    pixel_height = max(16, (TERMINAL_HEIGHT - 8) * 2)
+
+    try:
+        with Image.open(io.BytesIO(frame_bytes)) as image:
+            image = image.convert("RGB")
+            image.thumbnail((width, pixel_height), Image.LANCZOS)
+
+            canvas = Image.new("RGB", (width, pixel_height), (0, 0, 0))
+            x_offset = (width - image.width) // 2
+            y_offset = (pixel_height - image.height) // 2
+            canvas.paste(image, (x_offset, y_offset))
+            pixels = np.asarray(canvas)
+
+        result = Text()
+        for y in range(0, pixel_height, 2):
+            for x in range(width):
+                top = pixels[y, x]
+                bottom = pixels[min(y + 1, pixel_height - 1), x]
+                style = (
+                    f"rgb({int(top[0])},{int(top[1])},{int(top[2])}) "
+                    f"on rgb({int(bottom[0])},{int(bottom[1])},{int(bottom[2])})"
+                )
+                result.append("▀", style=style)
+            if y + 2 < pixel_height:
+                result.append("\n")
+        return result
+    except Exception as exc:
+        return Text(f"Görüntü emal edilə bilmədi: {exc}", style="bold red")
+
+
+def build_terminal_layout():
+    layout = Layout()
+    layout.split_column(
+        Layout(
+            Panel("Kindo Phone Remote — Reverse Mirroring", style="bold cyan"),
+            name="header",
+            size=3,
+        ),
+        Layout(name="screen", ratio=1),
+        Layout(
+            Panel(
+                "Status: Aktiv paylaşım" if state.is_active else "Status: Telefon bağlantısı gözlənilir",
+                style="green" if state.is_active else "yellow",
+            ),
+            name="footer",
+            size=3,
+        ),
+    )
+
+    frame = state.current_frame
+    layout["screen"].update(Panel(render_frame(frame), title="Telefon ekranı", border_style="cyan"))
+    return layout
+
+
 def render_terminal_screen():
-    """
-    Terminalda canlı ekran görüntüsü çəkərir.
-    """
-    console = rich.get_console()
-    
-    while True:
-        layout = Layout()
-        
-        # Layout quruluşu
-        layout.split_column(
-            Layout(Panel("Kindo Phone Remote - Reverse Mirroring", style="bold cyan"), name="header", size=3),
-            Layout(name="screen", ratio=3),
-            Layout(Panel("Status: Aktivdir. PC-dəki inputlar telefona göndərilir.", style="green"), name="footer", size=3)
-        )
-        
-        # Ekran görüntüsünü hazırla
-        if state.is_active and state.current_frame:
-            try:
-                img = Image.open(io.BytesIO(state.current_frame))
-                # Terminal ölçüsünə uyğun endir
-                img = img.resize((TERMINAL_WIDTH, TERMINAL_HEIGHT), Image.Resampling.LANCZOS)
-                pixels = np.array(img)
-                
-                # ANSI escape kodları ilə rəngli bloklar
-                output_lines = []
-                for y in range(TERMINAL_HEIGHT):
-                    line = []
-                    for x in range(TERMINAL_WIDTH):
-                        r, g, b = pixels[y, x]
-                        brightness = (r + g + b) / 3
-                        if brightness > 200:
-                            color_code = 15
-                        elif brightness > 150:
-                            color_code = 7
-                        elif brightness > 100:
-                            if r > g and
+    """Terminalda canlı telefon görüntüsünü göstərir."""
+    console = Console()
+    try:
+        with Live(
+            build_terminal_layout(),
+            console=console,
+            refresh_per_second=10,
+            screen=True,
+            transient=False,
+        ) as live:
+            while True:
+                live.update(build_terminal_layout(), refresh=True)
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+
+
+def run_server():
+    """FastAPI serverini ayrıca thread-də başladır."""
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="warning",
+        access_log=False,
+    )
+
+
+def main():
+    local_ip = get_local_ip()
+    url = f"http://{local_ip}:{PORT}/"
+
+    server_thread = threading.Thread(
+        target=run_server,
+        name="kindo-fastapi",
+        daemon=True,
+    )
+    server_thread.start()
+
+    input_thread = threading.Thread(
+        target=input_hook_listener,
+        name="kindo-input-listener",
+        daemon=True,
+    )
+    input_thread.start()
+
+    time.sleep(0.7)
+    generate_qr_terminal(url)
+    print("Çıxmaq üçün Ctrl+C basın.")
+
+    try:
+        render_terminal_screen()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nServer bağlanır...")
+
+
+if __name__ == "__main__":
+    main()
