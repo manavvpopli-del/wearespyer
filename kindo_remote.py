@@ -39,22 +39,44 @@ def get_local_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
-def generate_qr_terminal(url: str):
-    """Terminalda ASCII QR kod yaradır."""
-    console = Console()
-    console.print("\n[bold cyan]Kindo Phone Remote - Reverse Mirroring[/bold cyan]")
-    console.print(f"URL: [link]{url}[/link]")
-    console.print("Telefonunla skanla və 'Start Mirroring'ə bas:\n")
+def generate_qr_terminal(url: str) -> Panel:
+    """TUI daxilində skan edilə bilən QR paneli yaradır."""
     qr = qrcode.QRCode(
-        version=1,
+        version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
         box_size=1,
-        border=1,
+        border=2,
     )
     qr.add_data(url)
     qr.make(fit=True)
-    qr.print_ascii(invert=True)
-    console.print("="*65 + "\n")
+
+    matrix = qr.get_matrix()
+    if len(matrix) % 2:
+        matrix.append([False] * len(matrix[0]))
+
+    qr_text = Text()
+    for row in range(0, len(matrix), 2):
+        for col in range(len(matrix[row])):
+            top = matrix[row][col]
+            bottom = matrix[row + 1][col]
+            if top and bottom:
+                char = "█"
+            elif top:
+                char = "▀"
+            elif bottom:
+                char = "▄"
+            else:
+                char = " "
+            qr_text.append(char, style="black on white")
+        qr_text.append("\n", style="black on white")
+
+    qr_text.append("\n" + url, style="bold cyan on white")
+    return Panel(
+        qr_text,
+        title="Telefonla QR kodu skanla",
+        border_style="green",
+        style="on white",
+    )
 
 # --- Frontend HTML/JS Şablonu (Telefon üçün) ---
 HTML_TEMPLATE = """
@@ -231,6 +253,7 @@ class State:
         self.ws_connection = None
         self.loop = None
         self.send_lock = None
+        self.qr_panel = None
 
 state = State()
 
@@ -383,7 +406,7 @@ def build_terminal_layout():
             name="header",
             size=3,
         ),
-        Layout(name="screen", ratio=1),
+        Layout(name="content", ratio=1),
         Layout(
             Panel(
                 "Status: Aktiv paylaşım" if state.is_active else "Status: Telefon bağlantısı gözlənilir",
@@ -394,10 +417,23 @@ def build_terminal_layout():
         ),
     )
 
-    frame = state.current_frame
-    layout["screen"].update(Panel(render_frame(frame), title="Telefon ekranı", border_style="cyan"))
-    return layout
+    if state.is_active:
+        layout["content"].update(
+            Panel(render_frame(state.current_frame), title="Telefon ekranı", border_style="cyan")
+        )
+    else:
+        layout["content"].split_row(
+            Layout(name="screen", ratio=1),
+            Layout(name="qr", size=38),
+        )
+        layout["content"]["screen"].update(
+            Panel(render_frame(state.current_frame), title="Telefon ekranı", border_style="cyan")
+        )
+        layout["content"]["qr"].update(
+            state.qr_panel or Panel("QR kodu hazırlanır...", title="Telefonla tara")
+        )
 
+    return layout
 
 def render_terminal_screen():
     """Terminalda canlı telefon görüntüsünü göstərir."""
@@ -447,7 +483,7 @@ def main():
     input_thread.start()
 
     time.sleep(0.7)
-    generate_qr_terminal(url)
+    state.qr_panel = generate_qr_terminal(url)
     print("Çıxmaq üçün Ctrl+C basın.")
 
     try:
