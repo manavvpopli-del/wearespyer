@@ -6,22 +6,41 @@ import io
 import sys
 import qrcode
 import qrcode.constants
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import StreamingResponse, HTMLResponse
-import mss
-import mss.tools
-import pyautogui
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from PIL import Image
+import numpy as np
+import rich
+from rich.console import Console
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
+from rich.status import Status
+import threading
 
 # --- Konfiqurasiya ---
 PORT = 8765
-FPS = 12  # Sanayə 12 kadr (Performance üçün balanslaşdırılmış)
-JPEG_QUALITY = 70
+FPS = 10  # Terminal rendering üçün optimal FPS
+TERMINAL_WIDTH = 80
+TERMINAL_HEIGHT = 24
+ANSI_COLORS = [
+    "\x1b[38;5;0m",  # Black
+    "\x1b[38;5;9m",  # Red
+    "\x1b[38;5;2m",  # Green
+    "\x1b[38;5;11m", # Yellow
+    "\x1b[38;5;12m", # Blue
+    "\x1b[38;5;13m", # Magenta
+    "\x1b[38;5;6m",  # Cyan
+    "\x1b[38;5;15m"  # White
+]
+RESET = "\x1b[0m"
 
-# --- Utility funksiyaları ---
+# --- Utility ---
 def get_local_ip() -> str:
-    """Kompüterin Local IP ünvanını tapır."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -32,270 +51,306 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 def generate_qr_terminal(url: str):
-    """Terminalda ASCII QR kod yaradır."""
-    print("\n" + "="*30 + " Kİndo REMOTE " + "="*30)
-    print(f"URL: {url}")
-    print("Telefonunuzla skan edin:\n")
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=1,
-        border=1,
-    )
+    console = rich.get_console()
+    console.print("\n[bold cyan]Kindo Phone Remote[/bold cyan]")
+    console.print(f"URL: [link]{url}[/link]")
+    console.print("Telefonunla skanla və 'Start Mirroring'ə bas:\n")
+    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=1)
     qr.add_data(url)
     qr.make(fit=True)
     qr.print_ascii(invert=True)
-    print("="*65 + "\n")
 
-# --- Frontend HTML/JS Şablonu ---
-# Bu kod telefonun brauzerində işləyəcək interfeysdir
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="az">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Kindo Remote Session</title>
-    <style>
-        body { 
-            margin: 0; padding: 0; background: #111; color: #eee; 
-            font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; 
-            touch-action: none; /* Mobil üçün touch events idarəetməsi */
-        }
-        header { padding: 10px; background: #222; text-align: center; font-weight: bold; }
-        #container { flex: 1; display: flex; justify-content: center; align-items: center; overflow: hidden; position: relative; }
-        #screen { 
-            max-width: 100%; max-height: 100%; object-fit: contain; 
-            cursor: crosshair; background: #000; 
-        }
-        #status { padding: 5px; background: #333; text-align: center; font-size: 0.8rem; }
-        .connected { color: #4caf50; }
-        .disconnected { color: #f44336; }
-    </style>
-</head>
-<body>
-    <header>Kindo Remote - İdarəetmə Paneli</header>
-    <div id="container">
-        <!-- Ekran streami bu img elementinə gəlir -->
-        <img id="screen" src="/stream" alt="Remote Screen">
-    </div>
-    <div id="status" class="disconnected">Bağlanır...</div>
+# --- TUI Renderer (Terminalda Ekran Görüntüsü) ---
+class TerminalScreenRenderer:
+    def __init__(self, width=TERMINAL_WIDTH, height=TERMINAL_HEIGHT):
+        self.width = width
+        self.height = height
+        self.current_frame = None
+        self.last_update = 0
+        self.is_active = False
 
-    <script>
-        const screen = document.getElementById('screen');
-        const status = document.getElementById('status');
-        let ws;
-        let isDragging = false;
+    def update_frame(self, jpeg_bytes):
+        """Gələn JPEG frame-i rəngli ASCII bloklarına çevirir."""
+        try:
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            # Terminal ölçüsünə uyğun endir
+            img = img.resize((self.width, self.height), Image.Resampling.LANCZOS)
+            self.current_frame = img
+            self.last_update = time.time()
+            self.is_active = True
+        except Exception as e:
+            print(f"Render error: {e}")
 
-        function connect() {
-            // WebSocket bağlantısı qurulur
-            ws = new WebSocket(`ws://${location.host}/ws`);
-            
-            ws.onopen = () => {
-                status.innerText = "Bağlı (Connected)";
-                status.className = "connected";
-            };
-            
-            ws.onclose = () => {
-                status.innerText = "Bağlantı kəsildi. 2 saniyəyə yenidən cəhd edilir...";
-                status.className = "disconnected";
-                setTimeout(connect, 2000);
-            };
+    def render(self):
+        """Terminal üçün ANSI escape kodlarını qaytarır."""
+        if not self.current_frame:
+            return "[dim]Waiting for screen stream...[/dim]"
+        
+        pixels = np.array(self.current_frame)
+        output = []
+        
+        # Hər sətir üçün
+        for y in range(self.height):
+            line = []
+            for x in range(self.width):
+                r, g, b = pixels[y, x]
+                # Sadə rəng mapləməsi (256 rəngdən birini seç)
+                # Burada sadə bir heuristik istifadə edirik
+                brightness = (r + g + b) / 3
+                if brightness > 200:
+                    color_code = 15 # White
+                elif brightness > 150:
+                    color_code = 7  # Light Gray
+                elif brightness > 100:
+                    # Qırmızı/Yaşıl/Mavi balansına görə
+                    if r > g and r > b: color_code = 9
+                    elif g > r and g > b: color_code = 2
+                    elif b > r and b > g: color_code = 12
+                    else: color_code = 11
+                else:
+                    color_code = 0 # Black/Dark
+                
+                # Block character (şkilik blok)
+                block = "█"
+                line.append(f"\x1b[38;5;{color_code}m{block}")
+            output.append("".join(line) + RESET)
+        
+        return "\n".join(output)
 
-            ws.onerror = (e) => console.error(e);
-        }
+# --- FastAPI App ---
+app = FastAPI(title="Kindo Phone Remote")
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
 
-        // Ekran üzərindəki relative koordinatları tapır (0.0 - 1.0 arası)
-        function getCoords(e) {
-            const rect = screen.getBoundingClientRect();
-            // ClientX/Y ekrandakı absolut nöqtədir, rect.left/top isə elementin yeri
-            // Bu hesablamada elementin daxili hissəsinə klikləməni təmin edir
-            return {
-                x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
-                y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
-            };
-        }
-
-        function sendInput(data) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(data));
-            }
-        }
-
-        // --- Mouse Events (Desktop brauzer üçün) ---
-        screen.addEventListener('mousedown', (e) => {
-            isDragging = true;
-            const c = getCoords(e);
-            sendInput({ type: 'mouse', action: 'down', x: c.x, y: c.y, button: e.button });
-        });
-
-        screen.addEventListener('mouseup', (e) => {
-            isDragging = false;
-            const c = getCoords(e);
-            sendInput({ type: 'mouse', action: 'up', x: c.x, y: c.y, button: e.button });
-        });
-
-        screen.addEventListener('mousemove', (e) => {
-            if (isDragging) {
-                const c = getCoords(e);
-                sendInput({ type: 'mouse', action: 'move', x: c.x, y: c.y });
-            }
-        });
-
-        // --- Touch Events (Telefon üçün) ---
-        screen.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            const touch = e.touches[0];
-            isDragging = true;
-            const c = getCoords(touch);
-            sendInput({ type: 'mouse', action: 'down', x: c.x, y: c.y, button: 0 });
-        }, { passive: false });
-
-        screen.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            if (isDragging) {
-                const touch = e.touches[0];
-                const c = getCoords(touch);
-                sendInput({ type: 'mouse', action: 'move', x: c.x, y: c.y });
-            }
-        }, { passive: false });
-
-        screen.addEventListener('touchend', (e) => {
-            e.preventDefault();
-            isDragging = false;
-            const touch = e.changedTouches[0];
-            const c = getCoords(touch);
-            sendInput({ type: 'mouse', action: 'up', x: c.x, y: c.y, button: 0 });
-        }, { passive: false });
-
-        // --- Keyboard Events ---
-        document.addEventListener('keydown', (e) => {
-            // Saytın scroll olmaması üçün bu tuşları bloklayaq
-            if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
-                e.preventDefault();
-            }
-            if (!e.repeat) { // Həmin tuşun bir dəfə basıldığını göndər
-                sendInput({ type: 'key', action: 'down', key: e.key, code: e.code });
-            }
-        });
-
-        document.addEventListener('keyup', (e) => {
-            sendInput({ type: 'key', action: 'up', key: e.key, code: e.code });
-        });
-
-        connect();
-    </script>
-</body>
-</html>
-"""
-
-# --- FastAPI Tətbiqi ---
-app = FastAPI(title="Kindo Remote Terminal")
+# Global state
+renderer = TerminalScreenRenderer()
+input_queue = asyncio.Queue()
+connection_status = {"connected": False, "phone_info": "No Connection"}
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Ana səhifə - İnterfeysi qaytarır"""
-    return HTML_TEMPLATE
+    # Telefonun brauzerində açılacaq HTML
+    return """
+    <!DOCTYPE html>
+    <html lang="az">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>Kindo Phone Client</title>
+        <style>
+            body { font-family: sans-serif; background: #222; color: #eee; margin: 0; padding: 20px; text-align: center; }
+            button { padding: 15px 30px; font-size: 1.2em; background: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer; margin: 10px; }
+            button:active { transform: scale(0.95); }
+            #status { margin-top: 20px; padding: 10px; background: #333; border-radius: 5px; }
+            .log { text-align: left; max-height: 200px; overflow-y: auto; background: #111; padding: 10px; font-family: monospace; font-size: 0.8em; margin-top: 20px; }
+        </style>
+    </head>
+    <body>
+        <h1>Kindo Phone Client</h1>
+        <p>Bu səhifə telefonun ekranını PC-yə stream edəcək və PC-dən gələn inputları qəbul edəcək.</p>
+        <button id="startBtn">Start Mirroring & Input Bridge</button>
+        <div id="status">Hazırdır. Dəyərləndirmə üçün 'Start'ə bas.</div>
+        <div class="log" id="log">Loglar burada görünəcək...</div>
 
-@app.get("/stream")
-async def stream():
+        <script>
+            let ws;
+            let streamActive = false;
+            let logDiv = document.getElementById('log');
+            const statusDiv = document.getElementById('status');
+
+            function log(msg) {
+                logDiv.innerHTML += `<div>${new Date().toLocaleTimeString()} - ${msg}</div>`;
+                logDiv.scrollTop = logDiv.scrollHeight;
+            }
+
+            document.getElementById('startBtn').addEventListener('click', async () => {
+                log("Ekranı almaq üçün icazə ver...");
+                try {
+                    // Ekranı stream et (Browser Screen Capture)
+                    const stream = await navigator.mediaDevices.getDisplayMedia({
+                        video: { frameRate: 15 },
+                        audio: false
+                    });
+
+                    // WebSocket bağlantısı
+                    ws = new WebSocket(`ws://${location.host}/ws`);
+                    
+                    ws.onopen = () => {
+                        log("WebSocket bağlandı.");
+                        statusDiv.innerText = "Aktivdir. Ekranı və inputları göndərir.";
+                        startStreaming(stream);
+                    };
+
+                    ws.onmessage = (event) => {
+                        const input = JSON.parse(event.data);
+                        handleInput(input);
+                    };
+
+                    ws.onclose = () => {
+                        log("Bağlantı kəsildi.");
+                        statusDiv.innerText = "Bağlantı kəsildi.";
+                        stopStreaming();
+                    };
+
+                } catch (err) {
+                    log("Xəta: " + err.message);
+                    statusDiv.innerText = "Ekranı almaq mümkün olmadı.";
+                }
+            });
+
+            function startStreaming(stream) {
+                streamActive = true;
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                const video = document.createElement('video');
+                video.srcObject = stream;
+                video.play();
+
+                // Canvas-ı ekran ölçüsünə uyğun təyin et
+                canvas.width = window.screen.width;
+                canvas.height = window.screen.height;
+
+                // Hər 100ms-də bir frame çək və göndər
+                const interval = setInterval(() => {
+                    if (!streamActive) return;
+                    try {
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        canvas.toBlob((blob) => {
+                            if (blob && ws.readyState === WebSocket.OPEN) {
+                                // Base64 olaraq göndər (MJPEG sadəliyi üçün)
+                                const reader = new FileReader();
+                                reader.onloadend = () => {
+                                    const base64data = reader.result.split(',')[1];
+                                    ws.send(JSON.stringify({ type: 'frame', data: base64data }));
+                                };
+                                reader.readAsDataURL(blob);
+                            }
+                        }, 'image/jpeg', 0.7);
+                    } catch(e) {
+                        log("Stream xətası: " + e.message);
+                    }
+                }, 100); // 10 FPS
+            }
+
+            function stopStreaming() {
+                streamActive = false;
+                if (ws) ws.close();
+            }
+
+            // PC-dən gələn inputları işlə
+            function handleInput(input) {
+                if (input.type === 'key') {
+                    // Virtual klaviatura hadisəsi yarat
+                    const event = new KeyboardEvent(input.action, {
+                        key: input.key,
+                        code: input.code,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    document.dispatchEvent(event);
+                    log(`Key: ${input.key} (${input.action})`);
+                } else if (input.type === 'mouse') {
+                    // Virtual mouse hadisəsi yarat
+                    // Koordinatlar ekrana nisbətən olmalıdır
+                    const x = input.x * window.screen.width;
+                    const y = input.y * window.screen.height;
+                    const event = new MouseEvent(input.action, {
+                        view: window,
+                        bubbles: true,
+                        cancelable: true,
+                        clientX: x,
+                        clientY: y
+                    });
+                    document.dispatchEvent(event);
+                    log(`Mouse: ${input.action} at (${x}, ${y})`);
+                }
+            }
+
+            // Ekranı tam ekran rejimində aç (İstifadəçi təcrübəsi üçün)
+            function toggleFullscreen() {
+                if (!document.fullscreenElement) {
+                    document.documentElement.requestFullscreen().catch(err => {
+                        console.log(`Error attempting to enable fullscreen mode: ${err.message}`);
+                    });
+                } else {
+                    document.exitFullscreen();
+                }
+            }
+            
+            // Add a button for fullscreen
+            const fsBtn = document.createElement('button');
+            fsBtn.innerText = "Toggle Fullscreen";
+            fsBtn.onclick = toggleFullscreen;
+            document.body.insertBefore(fsBtn, document.getElementById('startBtn'));
+        </script>
+    </body>
+    </html>
     """
-    MJPEG Video Stream.
-    Ekranı tutub, JPEG formatına çevirir və brauzerə yollayır.
-    """
-    def event_generator():
-        with mss.mss() as sct:
-            # 1-ci monitor (adətən əsas ekran)
-            monitor = sct.monitors[1] 
-            while True:
-                im = sct.grab(monitor)
-                
-                # MSS PNG verir, biz JPEG-a çeviririk ki, fayl kiçik olsun
-                png = mss.tools.to_png(im, monitor)
-                image = Image.open(io.BytesIO(png))
-                
-                # Performans üçün, ekranda çox böyükdirsə, azaldırıq (opsional)
-                if image.width > 1920:
-                    image = image.resize((1920, int(image.height * (1920/image.width))))
-
-                f = io.BytesIO()
-                image.save(f, format="JPEG", quality=JPEG_QUALITY)
-                data = f.getvalue()
-                
-                # MJPEG formatında frame göndər
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + data + b'\r\n')
-                
-                # FPS-lə uyğun pauza
-                time.sleep(1 / FPS)
-
-    return StreamingResponse(event_generator(), media_type="multipart/x-mixed-replace;boundary=frame")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint.
-    Brauzerdən gələn inputları (mouse, klaviatura) qəbul edir və OS-a tətbiq edir.
+    Telefonun brauzerindən gələn frame-ları qəbul edir və TUI renderer-a yollayır.
+    Eyni zamanda, PC-dən gələn inputları telefona göndərir.
     """
     await websocket.accept()
-    screen_w, screen_h = pyautogui.size()
+    connection_status["connected"] = True
+    connection_status["phone_info"] = "Connected"
+    print("[WS] Telefon bağlandı.")
+
+    # Input handler thread (PC klaviatura/mouse -> WebSocket)
+    # Bu hissə üçün, sən PC-dəki klaviatura hadisələrini dinləməliyəm.
+    # PyAutoGUI istifadə edib, inputları qəbul etmək üçün "Input Hook" quraq.
     
-    # Failsafe (Ctrl+C ilə dayandırmaq üçün) - istəyirsinizsə sökdürün
-    pyautogui.FAILSAFE = False 
-    
-    print(f"[WS] Müştəri qoşuldu. Ekran ölçüsü: {screen_w}x{screen_h}")
-    
+    input_thread = threading.Thread(target=input_hook_listener, daemon=True)
+    input_thread.start()
+
     try:
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
             
-            if msg["type"] == "mouse":
-                # Normalizə edilmiş koordinatları real pikselə çevir
-                x = int(msg["x"] * screen_w)
-                y = int(msg["y"] * screen_h)
+            if msg["type"] == "frame":
+                # Base64 JPEG decode et
+                jpeg_bytes = base64.b64decode(msg["data"])
+                renderer.update_frame(jpeg_bytes)
                 
-                # Sərhədləri yoxla (güvənlik üçün)
-                x = max(0, min(x, screen_w - 1))
-                y = max(0, min(y, screen_h - 1))
-
-                if msg["action"] == "move":
-                    pyautogui.moveTo(x, y, _pause=False)
-                elif msg["action"] == "down":
-                    # Sol və ya sağ klik
-                    button = 'left' if msg.get("button", 0) == 0 else 'right'
-                    pyautogui.mouseDown(x=x, y=y, button=button, _pause=False)
-                elif msg["action"] == "up":
-                    button = 'left' if msg.get("button", 0) == 0 else 'right'
-                    pyautogui.mouseUp(x=x, y=y, button=button, _pause=False)
-
-            elif msg["type"] == "key":
-                key = msg["key"]
-                # Xüsusi tuşlar (Enter, Shift, etc.)
-                # PyAutoGUI üçün düzgün sintaksısdan istifadə et
-                if key == 'Enter':
-                    key = 'enter'
-                elif key == ' ':
-                    key = 'space'
-                elif key == 'Shift':
-                    key = 'shift'
-                
-                if msg["action"] == "down":
-                    pyautogui.keyDown(key, _pause=False)
-                elif msg["action"] == "up":
-                    pyautogui.keyUp(key, _pause=False)
-                    
     except WebSocketDisconnect:
-        print("[WS] Müştəri ayrıldı.")
+        connection_status["connected"] = False
+        connection_status["phone_info"] = "Disconnected"
+        print("[WS] Telefon ayrıldı.")
 
-# --- Main Executor ---
-if __name__ == "__main__":
-    ip = get_local_ip()
-    url = f"http://{ip}:{PORT}"
+# --- Input Hook Listener (PC Input -> Phone) ---
+import pyautogui
+import keyboard
+
+def input_hook_listener():
+    """
+    PC-dəki klaviatura və mouse hadisələrini dinləyir və WebSocket-ə yollayır.
+    """
+    # PyAutoGUI-nin mouse dinləyicisi üçün
+    last_mouse_pos = pyautogui.position()
     
-    # Terminalda QR kod göstər
-    generate_qr_terminal(url)
-    
-    # Uvicorn serveri başlat
-    print(f"Server {url} ünvanında işləyir... (Dayandırmaq üçün Ctrl+C)")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    def on_key_event(event):
+        if event.event_type == 'down':
+            # Klaviş adını al
+            key_name = event.name
+            # Xüsusi tuşları əhatə et
+            if key_name in ['ctrl', 'shift', 'alt', 'cmd']:
+                pass # Modifier tuşlar üçün ayrıca idarəetmə
+            else:
+                send_to_phone({"type": "key", "action": "down", "key": key_name, "code": key_name.upper()})
+        elif event.event_type == 'up':
+            key_name = event.name
+            send_to_phone({"type": "key", "action": "up", "key": key_name, "code": key_name.upper()})
+
+    keyboard.hook(on_key_event)
+
+    # Mouse dinləyicisi (PyAutoGUI loop)
+    while True:
+        current_mouse_pos = pyautogui.position()
+        if current_mouse_pos != last_mouse_pos:
+            # Normalizə edilmiş koordinatlar (0.0 - 1.0)
+            screen_w, screen_h = pyautogui.size()
+            rel_x = current_mouse_pos.x / screen_w
+            rel_y = current_mouse_pos.y / screen_h
+            send_to_phone({"type": "mouse", "action": "move", "x": rel_x, "
